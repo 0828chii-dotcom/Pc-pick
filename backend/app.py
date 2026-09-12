@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 BASE=os.path.dirname(os.path.dirname(__file__))
 FRONT=os.path.join(BASE,'frontend','index.html')
-app=FastAPI(title='PC PICK Private',version='5.6-private')
+app=FastAPI(title='PC PICK Private',version='5.6-private.1')
 USER=os.getenv('PCPICK_USER','pcpick'); PASSWORD=os.getenv('PCPICK_PASSWORD','')
 ROOTS=('gmarket.co.kr','danawa.com')
 
@@ -27,12 +27,37 @@ async def gate(request:Request,call_next):
 
 class AnalyzeURL(BaseModel):url:str
 
+def official_host(host):
+ host=(host or '').lower().rstrip('.')
+ return any(host==r or host.endswith('.'+r) for r in ROOTS)
+
 def extract(raw):
  raw=(raw or '').strip()
- m=re.fullmatch(r'\[[^\]]*\]\((https?://[^)\s]+)\)',raw,re.I)
- if m:raw=m.group(1)
- if not raw or len(raw)>4096 or any(c.isspace() for c in raw):raise HTTPException(400,'상품 링크만 입력해 주세요.')
- return raw
+ if not raw or len(raw)>12000:
+  raise HTTPException(400,'상품 링크를 붙여넣어 주세요.')
+
+ # 1) 일반 URL / 쇼핑앱 공유 문구 안의 URL을 모두 찾습니다.
+ candidates=re.findall(r'https?://[^\s<>"\']+',raw,re.I)
+ # 2) 일부 앱은 https:// 없이 도메인만 복사하기도 합니다.
+ if not candidates:
+  bare=re.findall(r'(?:(?:[a-z0-9-]+\.)+(?:gmarket\.co\.kr|danawa\.com))(?:/[^\s<>"\']*)?',raw,re.I)
+  candidates=['https://'+x for x in bare]
+
+ cleaned=[]
+ for c in candidates:
+  c=c.strip().rstrip(').,]}〉》」』!?;:\u3002，')
+  if c and c not in cleaned:cleaned.append(c)
+
+ # 지원 쇼핑몰 공식 주소가 여러 개 섞여 있으면 그중 첫 번째만 사용합니다.
+ for c in cleaned:
+  try:
+   q=urlparse(c)
+   if q.scheme in ('http','https') and official_host(q.hostname):return c
+  except Exception:pass
+
+ if cleaned:
+  raise HTTPException(400,'현재는 G마켓/다나와 공식 상품 링크만 지원합니다.')
+ raise HTTPException(400,'복사한 내용에서 상품 링크를 찾지 못했습니다.')
 
 def validate(raw):
  raw=extract(raw)
@@ -40,7 +65,7 @@ def validate(raw):
  except:raise HTTPException(400,'올바른 URL이 아닙니다.')
  if q.scheme not in ('http','https') or not q.hostname or q.username or q.password or port not in (None,80,443):raise HTTPException(400,'올바른 상품 URL이 아닙니다.')
  host=q.hostname.lower().rstrip('.')
- if not any(host==r or host.endswith('.'+r) for r in ROOTS):raise HTTPException(400,'현재는 G마켓/다나와 공식 링크만 지원합니다.')
+ if not official_host(host):raise HTTPException(400,'현재는 G마켓/다나와 공식 링크만 지원합니다.')
  try:infos=socket.getaddrinfo(host,None)
  except socket.gaierror:raise HTTPException(502,'쇼핑몰 주소 확인에 실패했습니다.')
  for x in infos:
@@ -90,7 +115,7 @@ def parse_gmarket(url,html):
 @app.get('/')
 def home():return FileResponse(FRONT)
 @app.get('/api/health')
-def health():return {'ok':True,'version':'5.6-private'}
+def health():return {'ok':True,'version':'5.6-private.1'}
 @app.post('/api/analyze-url')
 def analyze(req:AnalyzeURL):
  final,html,hist=fetch(req.url)
