@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 BASE=os.path.dirname(os.path.dirname(__file__))
 FRONT=os.path.join(BASE,'frontend','index.html')
-app=FastAPI(title='PC PICK Private',version='5.6-private.2')
+app=FastAPI(title='PC PICK Private',version='5.6-private.3')
 USER=os.getenv('PCPICK_USER','pcpick'); PASSWORD=os.getenv('PCPICK_PASSWORD','')
 ROOTS=('gmarket.co.kr','danawa.com')
 
@@ -34,10 +34,17 @@ def official_host(host):
 def extract(raw):
  raw=(raw or '').strip()
  if not raw or len(raw)>12000:raise HTTPException(400,'상품 링크를 붙여넣어 주세요.')
- candidates=re.findall(r'https?://[^\s<>"\']+',raw,re.I)
+
+ # Markdown 링크([텍스트](URL))는 일반 URL 정규식보다 먼저 처리합니다.
+ markdown_targets=re.findall(r'\[[^\]]*\]\((https?://[^)\s]+)\)',raw,re.I)
+ candidates=list(markdown_targets)
+
+ # 일반 URL / 쇼핑앱 공유 문구 안의 URL을 모두 찾습니다.
+ candidates += re.findall(r'https?://[^\s<>"\'\]\[()]+',raw,re.I)
  if not candidates:
-  bare=re.findall(r'(?:(?:[a-z0-9-]+\.)+(?:gmarket\.co\.kr|danawa\.com))(?:/[^\s<>"\']*)?',raw,re.I)
+  bare=re.findall(r'(?:(?:[a-z0-9-]+\.)+(?:gmarket\.co\.kr|danawa\.com))(?:/[^\s<>"\'\]\[()]*)?',raw,re.I)
   candidates=['https://'+x for x in bare]
+
  cleaned=[]
  for c in candidates:
   c=c.strip().rstrip(').,]}〉》」』!?;:\u3002，')
@@ -96,15 +103,10 @@ def text_meta(s,selector,attr='content'):
  return (e.get(attr,'').strip() if e else '')
 
 def best_title(s,html,code):
- candidates=[
-  text_meta(s,'meta[property="og:title"]'),
-  text_meta(s,'meta[name="title"]'),
-  text_meta(s,'meta[name="twitter:title"]'),
- ]
+ candidates=[text_meta(s,'meta[property="og:title"]'),text_meta(s,'meta[name="title"]'),text_meta(s,'meta[name="twitter:title"]')]
  for tag in s.select('script[type="application/ld+json"]'):
   try:
-   obj=json.loads(tag.string or tag.get_text() or '{}')
-   objs=obj if isinstance(obj,list) else [obj]
+   obj=json.loads(tag.string or tag.get_text() or '{}'); objs=obj if isinstance(obj,list) else [obj]
    for x in objs:
     if isinstance(x,dict) and str(x.get('@type','')).lower()=='product':candidates.append(str(x.get('name','')).strip())
   except Exception:pass
@@ -122,10 +124,7 @@ def best_title(s,html,code):
  return f'G마켓 상품 #{code}' if code else 'G마켓 상품'
 
 def default_option(text,label):
- pats=[
-  label+r'.{0,80}?\(기본\)\s*([^+|]{2,100}?)(?=\s*\+?￦|\s*\d+\.|$)',
-  label+r'.{0,80}?기본\s*[:\-]?\s*([^|]{2,100}?)(?=\s*\+?￦|\s*\d+\.|$)'
- ]
+ pats=[label+r'.{0,80}?\(기본\)\s*([^+|]{2,100}?)(?=\s*\+?￦|\s*\d+\.|$)',label+r'.{0,80}?기본\s*[:\-]?\s*([^|]{2,100}?)(?=\s*\+?￦|\s*\d+\.|$)']
  for p in pats:
   m=re.search(p,text,re.I)
   if m:return re.sub(r'\s+',' ',m.group(1)).strip(' -')
@@ -155,28 +154,22 @@ def global_gmarket_fallback(code):
  try:r=requests.get(url,headers=h,timeout=15)
  except requests.RequestException:return None
  if r.status_code!=200 or not r.text:return None
- d=parse_gmarket(url,r.text,'global_fallback')
- # 글로벌 페이지의 상품명은 오래된 등록명일 수 있어 실제 현재 구성으로 단정하지 않습니다.
- d['title']=f'G마켓 상품 #{code}'
- d['status']='PARTIAL'
- d['note']='국내 상품 페이지 자동 읽기가 제한되어 공개 보조 정보로 일부 항목만 표시합니다. 정확한 CPU/보드/쿨러는 확인 필요입니다.'
+ d=parse_gmarket(url,r.text,'global_fallback'); d['title']=f'G마켓 상품 #{code}'; d['status']='PARTIAL'; d['note']='국내 상품 페이지 자동 읽기가 제한되어 공개 보조 정보로 일부 항목만 표시합니다. 정확한 CPU/보드/쿨러는 확인 필요입니다.'
  return d
 
 @app.get('/')
 def home():return FileResponse(FRONT)
 @app.get('/api/health')
-def health():return {'ok':True,'version':'5.6-private.2'}
+def health():return {'ok':True,'version':'5.6-private.3'}
 @app.post('/api/analyze-url')
 def analyze(req:AnalyzeURL):
- final,html,hist=fetch(req.url)
- host=(urlparse(final).hostname or '').lower()
+ final,html,hist=fetch(req.url); host=(urlparse(final).hostname or '').lower()
  if host.endswith('gmarket.co.kr'):
   code=gmarket_code(final,html or '')
   if html is None:
    d=global_gmarket_fallback(code) or {'recognized':True,'status':'ACCESS_LIMITED','shop':'Gmarket','product_code':code,'title':f'G마켓 상품 #{code}' if code else 'G마켓 상품','type':'UNKNOWN','prices':{},'components':{},'final_url':final,'note':'정상 링크지만 쇼핑몰이 자동 읽기를 제한했습니다.'}
    d['redirect_history']=hist;return d
   d=parse_gmarket(final,html)
-  # 국내 페이지가 빈 셸만 반환하면 보조 공개 페이지에서 옵션/가격을 한 번 더 채웁니다.
   useful=sum(bool(x) for x in [d.get('product_code'),d.get('prices',{}).get('coupon'),d.get('components',{}).get('CPU'),d.get('components',{}).get('RAM'),d.get('components',{}).get('SSD')])
   if useful<=1 and d.get('product_code'):
    fb=global_gmarket_fallback(d['product_code'])
