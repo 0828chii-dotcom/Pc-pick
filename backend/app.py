@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 BASE=os.path.dirname(os.path.dirname(__file__))
 FRONT=os.path.join(BASE,'frontend','index.html')
-app=FastAPI(title='PC PICK Private',version='5.6-private.3')
+app=FastAPI(title='PC PICK Private',version='5.7-private')
 USER=os.getenv('PCPICK_USER','pcpick'); PASSWORD=os.getenv('PCPICK_PASSWORD','')
 ROOTS=('gmarket.co.kr','danawa.com')
 
@@ -26,6 +26,9 @@ async def gate(request:Request,call_next):
  return await call_next(request)
 
 class AnalyzeURL(BaseModel):url:str
+class AnalyzeImageText(BaseModel):
+ ocr_text:str
+ source_url:str|None=None
 
 def official_host(host):
  host=(host or '').lower().rstrip('.')
@@ -34,17 +37,12 @@ def official_host(host):
 def extract(raw):
  raw=(raw or '').strip()
  if not raw or len(raw)>12000:raise HTTPException(400,'상품 링크를 붙여넣어 주세요.')
-
- # Markdown 링크([텍스트](URL))는 일반 URL 정규식보다 먼저 처리합니다.
  markdown_targets=re.findall(r'\[[^\]]*\]\((https?://[^)\s]+)\)',raw,re.I)
  candidates=list(markdown_targets)
-
- # 일반 URL / 쇼핑앱 공유 문구 안의 URL을 모두 찾습니다.
  candidates += re.findall(r'https?://[^\s<>"\'\]\[()]+',raw,re.I)
  if not candidates:
   bare=re.findall(r'(?:(?:[a-z0-9-]+\.)+(?:gmarket\.co\.kr|danawa\.com))(?:/[^\s<>"\'\]\[()]*)?',raw,re.I)
   candidates=['https://'+x for x in bare]
-
  cleaned=[]
  for c in candidates:
   c=c.strip().rstrip(').,]}〉》」』!?;:\u3002，')
@@ -143,7 +141,7 @@ def parse_gmarket(url,html,source='primary'):
  cpu=comp([r'(라이젠\s*[3579]?\s*\d{4,5}(?:X3D|X|G)?)',r'(Ryzen\s*[3579]?\s*\d{4,5}(?:X3D|X|G)?)',r'(i[3579][-\s]?\d{4,5}[A-Z]{0,2})'])
  gpu=comp([r'((?:GeForce\s+)?RTX\s*\d{4}(?:\s*(?:Ti|SUPER))?)',r'((?:Radeon\s+)?RX\s*\d{4}(?:\s*XT)?)'])
  typ='BAREBONE' if '반본체' in (title+' '+text) else ('COMPLETE' if gpu else 'UNKNOWN')
- components={'CPU':cpu,'GPU':gpu,'RAM':default_option(text,'RAM 변경'),'SSD':default_option(text,'SSD 변경'),'PSU':default_option(text,'파워 변경'),'CASE':default_option(text,'케이스 변경'),'MOTHERBOARD':None,'COOLER':None}
+ components={'CPU':cpu,'GPU':gpu,'RAM':default_option(text,'RAM 변경'),'SSD':default_option(text,'SSD 변경'),'PSU':default_option(text,'파워 변경'),'CASE':default_option(text,'케이스 변경'),'MOTHERBOARD':None,'COOLER':None,'OS':None}
  prices={'list':price(r'(?:판매가|기존가|Price)'),'coupon':price('쿠폰적용가'),'payment_conditional':price('결제할인가')}
  return {'recognized':True,'status':'OK','shop':'Gmarket','product_code':code,'title':title,'type':typ,'prices':prices,'components':components,'final_url':url,'source':source,'note':'확인되지 않은 부품은 추정하지 않습니다.'}
 
@@ -157,10 +155,44 @@ def global_gmarket_fallback(code):
  d=parse_gmarket(url,r.text,'global_fallback'); d['title']=f'G마켓 상품 #{code}'; d['status']='PARTIAL'; d['note']='국내 상품 페이지 자동 읽기가 제한되어 공개 보조 정보로 일부 항목만 표시합니다. 정확한 CPU/보드/쿨러는 확인 필요입니다.'
  return d
 
+def clean_ocr(text):
+ text=(text or '').replace('\r','\n')
+ text=re.sub(r'[ \t]+',' ',text)
+ text=re.sub(r'\n{3,}','\n\n',text)
+ return text.strip()
+
+def first_match(text,patterns):
+ for p in patterns:
+  m=re.search(p,text,re.I|re.S)
+  if m:
+   v=re.sub(r'\s+',' ',m.group(1)).strip(' -:/|')
+   if v:return v
+ return None
+
+def parse_image_ocr(raw):
+ text=clean_ocr(raw); flat=re.sub(r'\s+',' ',text)
+ if len(flat)<12:raise HTTPException(400,'이미지에서 읽힌 글자가 너무 적습니다. 사양표가 보이도록 다시 촬영해 주세요.')
+ cpu=first_match(flat,[r'((?:AMD\s*)?(?:라이젠|Ryzen)\s*[3579]?[- ]?\s*\d{4,5}\s*(?:X3D|X|G)?)',r'((?:Intel\s*)?Core\s*(?:Ultra\s*)?[3579]\s*[- ]?\s*\d{4,5}[A-Z]{0,2})',r'(i[3579][ -]?\d{4,5}[A-Z]{0,2})'])
+ mb=first_match(flat,[r'((?:GIGABYTE|기가바이트|ASUS|MSI|ASRock|애즈락)\s+[A-Z]?[BHZ]\d{3,4}[A-Z0-9 -]{0,24})'])
+ ram=first_match(flat,[r'((?:지티엠코리아|삼성|Samsung|마이크론|Micron|SK하이닉스|TeamGroup|G\.SKILL)?\s*DDR[45][ -]?\d{4,5}\s*\d{1,3}GB(?:\s*\(?\s*\d{1,3}G?\s*[xX×]\s*\d\s*\)?)?)',r'(DDR[45][ -]?\d{4,5}[\s\S]{0,30}?\d{1,3}GB)'])
+ ssd=first_match(flat,[r'((?:마이크론|Micron)?\s*(?:Crucial\s*)?[A-Z]?[A-Z0-9-]{2,20}\s*(?:\d+(?:\.\d+)?\s*(?:TB|GB)))',r'((?:Crucial|Samsung|삼성|KIOXIA|키오시아|SK hynix|WD|Western Digital)[A-Z0-9 ._-]{1,35}\s\d+(?:\.\d+)?\s*(?:TB|GB))'])
+ gpu=first_match(flat,[r'((?:GeForce\s*)?RTX\s*\d{4}\s*(?:Ti|SUPER)?)',r'((?:Radeon\s*)?RX\s*\d{4}\s*(?:XT)?)'])
+ if not gpu and re.search(r'(AMD\s*)?내장\s*그래픽|integrated\s*graphics',flat,re.I):gpu='AMD 내장 그래픽' if re.search(r'AMD|라이젠|Ryzen',flat,re.I) else '내장 그래픽'
+ cooler=first_match(flat,[r'((?:잘만|ZALMAN)?\s*CNPS[A-Z0-9 -]{2,24})',r'((?:DEEPCOOL|딥쿨|Thermalright|써멀라이트)[A-Z0-9 _-]{2,30})'])
+ psu=first_match(flat,[r'((?:마이크로닉스|Micronics)?\s*WIZMAX\s*\d{3,4}W)',r'((?:SuperFlower|슈퍼플라워|Cooler Master|쿨러마스터|Micronics|마이크로닉스)[A-Z0-9 ._-]{2,35}\s\d{3,4}W)'])
+ case=first_match(flat,[r'((?:잘만|ZALMAN)\s*i8\s*백사십\s*터보)',r'((?:잘만|ZALMAN|앱코|ABKO|darkFlash|DAVEN)[A-Z0-9가-힣 _-]{2,30}(?:케이스|터보)?)'])
+ os_name='FreeDOS' if re.search(r'Free\s*DOS|FreeDos',flat,re.I) else ('Windows' if re.search(r'Windows\s*1[01]',flat,re.I) else None)
+ components={'CPU':cpu,'MOTHERBOARD':mb,'RAM':ram,'SSD':ssd,'GPU':gpu,'CASE':case,'COOLER':cooler,'PSU':psu,'OS':os_name}
+ found=sum(bool(v) for v in components.values())
+ return {'recognized':found>=2,'status':'OK' if found>=5 else 'PARTIAL','shop':None,'product_code':None,'title':'이미지 사양 분석','type':'UNKNOWN','prices':{},'components':components,'source':'image_ocr','confidence':round(found/len(components),2),'raw_text':text[:5000],'note':f'이미지에서 {found}/{len(components)}개 주요 항목을 인식했습니다. 이미지에 없는 정보는 추정하지 않습니다.'}
+
 @app.get('/')
 def home():return FileResponse(FRONT)
 @app.get('/api/health')
-def health():return {'ok':True,'version':'5.6-private.3'}
+def health():return {'ok':True,'version':'5.7-private'}
+@app.post('/api/analyze-image')
+def analyze_image(req:AnalyzeImageText):
+ return parse_image_ocr(req.ocr_text)
 @app.post('/api/analyze-url')
 def analyze(req:AnalyzeURL):
  final,html,hist=fetch(req.url); host=(urlparse(final).hostname or '').lower()
